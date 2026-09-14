@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 
 from resource_aware_agent import Request, ResourceAwareAgent, ResourceBudget, result_as_dict
 
@@ -13,7 +14,14 @@ def print_result(title: str, result: object) -> None:
 
 
 def main() -> None:
-    agent = ResourceAwareAgent()
+    parser = argparse.ArgumentParser(description="Resource-aware agent routing demo")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Use the OpenAI-compatible large-model endpoint configured in .env",
+    )
+    args = parser.parse_args()
+    agent = ResourceAwareAgent.live_from_dotenv() if args.live else ResourceAwareAgent()
 
     calculation = Request("Calculate (125 * 8) + 40")
     print_result("Specialized tool", agent.handle(calculation))
@@ -29,9 +37,15 @@ def main() -> None:
     complex_request = Request(
         "Analyze the architecture trade-offs and risks, compare three options, and recommend a migration plan.",
         context=long_context,
-        budget=ResourceBudget(max_cost_usd=0.04, max_latency_ms=900, max_tokens=500),
+        budget=ResourceBudget(max_cost_usd=0.04, max_latency_ms=900, max_tokens=1_500),
     )
     print_result("Context pruning and escalation", agent.handle(complex_request))
+
+    verified_sensitive = Request(
+        "Review this confidential contract and identify the major legal risks.",
+        contains_sensitive_data=True,
+    )
+    print_result("Advanced model plus verification", agent.handle(verified_sensitive))
 
     sensitive = Request(
         "Review this confidential contract and identify the major legal risks.",

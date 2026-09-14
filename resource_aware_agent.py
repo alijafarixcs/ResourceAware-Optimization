@@ -12,9 +12,12 @@ import hashlib
 import json
 import operator
 import re
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 from threading import Lock
 from typing import Iterable
 
@@ -23,6 +26,32 @@ def estimate_tokens(text: str) -> int:
     """A deliberately simple token estimate suitable for routing decisions."""
 
     return max(1, (len(text) + 3) // 4)
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    """Connection details loaded from the project .env without logging secrets."""
+
+    url: str
+    key: str
+    model_name: str
+
+    @classmethod
+    def from_dotenv(cls, path: str | Path = ".env") -> "LLMSettings":
+        values: dict[str, str] = {}
+        env_path = Path(path)
+        if not env_path.is_file():
+            raise FileNotFoundError(f"Live mode requires {env_path}")
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            values[name.strip()] = value.strip().strip("\"").strip("'")
+        missing = [name for name in ("url", "key", "model-name") if not values.get(name)]
+        if missing:
+            raise ValueError(f"Missing .env setting(s): {', '.join(missing)}")
+        return cls(values["url"], values["key"], values["model-name"])
 
 
 class TaskKind(str, Enum):
@@ -69,6 +98,7 @@ class ResourceProfile:
     max_context_tokens: int
     local: bool = False
     quantization: str | None = None
+    communication_tokens: int = 0
 
 
 @dataclass
@@ -120,6 +150,25 @@ MODELS = (
     ResourceProfile(
         "large-cloud", "model", 0.96, 0.028, 520, 1_600, 0.42, 8_000
     ),
+)
+
+# Three small specialists operate in parallel on disjoint parts of the request and a
+# coordinator synthesizes their outputs.  The price/latency/energy fields include all
+# four calls; communication_tokens makes the coordination overhead explicit.
+MULTI_AGENT_TEAM = ResourceProfile(
+    "three-agent-panel",
+    "multi-agent",
+    0.955,
+    0.009,
+    290,
+    900,
+    0.26,
+    2_000,
+    communication_tokens=60,
+)
+
+VERIFIER = ResourceProfile(
+    "output-verifier", "verifier", 0.99, 0.003, 80, 150, 0.03, 500
 )
 
 TOOLS = {
@@ -178,8 +227,8 @@ class ContextManager:
     def reduce(self, request: Request, max_context_tokens: int) -> ContextView:
         full = "\n".join((*request.context, request.prompt))
         before = estimate_tokens(full)
-        # Reserve at least half the request budget for the generated response.
-        target = max(40, min(max_context_tokens, request.budget.max_tokens // 2))
+        # Reserve capacity for output and possible quality-gate retries.
+        target = max(40, min(max_context_tokens, request.budget.max_tokens // 4))
         if before <= target:
             return ContextView(full, before, before, 0)
 
@@ -243,6 +292,7 @@ class ResourcePredictor:
             self._history[strategy] = self._history[strategy][-20:]
 
     def predict(self, profile: ResourceProfile, input_tokens: int) -> Usage:
+        routed_input_tokens = input_tokens + profile.communication_tokens
         with self._lock:
             history = list(self._history.get(profile.name, ()))
         if history:
@@ -250,7 +300,7 @@ class ResourcePredictor:
             return Usage(
                 cost_usd=sum(x.cost_usd for x in history) / count,
                 latency_ms=int(sum(x.latency_ms for x in history) / count),
-                input_tokens=input_tokens,
+                input_tokens=routed_input_tokens,
                 output_tokens=int(sum(x.output_tokens for x in history) / count),
                 memory_mb=max(x.memory_mb for x in history),
                 energy_units=sum(x.energy_units for x in history) / count,
@@ -258,7 +308,7 @@ class ResourcePredictor:
         return Usage(
             profile.fixed_cost_usd,
             profile.latency_ms,
-            input_tokens,
+            routed_input_tokens,
             min(180, max(20, input_tokens // 2)),
             profile.memory_mb,
             profile.energy_units,
@@ -301,7 +351,11 @@ class Router:
         return (
             already.cost_usd + usage.cost_usd <= budget.max_cost_usd
             and already.latency_ms + usage.latency_ms <= budget.max_latency_ms
-            and usage.input_tokens + usage.output_tokens <= budget.max_tokens
+            and already.input_tokens
+            + already.output_tokens
+            + usage.input_tokens
+            + usage.output_tokens
+            <= budget.max_tokens
             and usage.memory_mb <= budget.max_memory_mb
             and already.energy_units + usage.energy_units <= budget.max_energy_units
         )
@@ -317,6 +371,8 @@ class Router:
             # Privacy-aware hybrid path: local first; cloud remains an escalation option.
             available.sort(key=lambda p: (not p.local, p.fixed_cost_usd))
         else:
+            if complexity is Complexity.COMPLEX:
+                available.append(MULTI_AGENT_TEAM)
             available.sort(
                 key=lambda p: (
                     p.fixed_cost_usd
@@ -361,10 +417,41 @@ class SafeCalculator:
 class SimulatedBackends:
     """Replace these methods with real SDK/API calls in a production system."""
 
-    def __init__(self) -> None:
+    def __init__(self, live_settings: LLMSettings | None = None) -> None:
         self.calculator = SafeCalculator()
+        self.live_settings = live_settings
 
-    def run(self, profile: ResourceProfile, request: Request, context: ContextView) -> str:
+    def _run_live_llm(
+        self, request: Request, context: ContextView, max_output_tokens: int
+    ) -> str:
+        assert self.live_settings is not None
+        payload = json.dumps(
+            {
+                "model": self.live_settings.model_name,
+                "messages": [{"role": "user", "content": context.text}],
+                "max_tokens": max(1, max_output_tokens),
+            }
+        ).encode("utf-8")
+        http_request = urllib.request.Request(
+            self.live_settings.url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.live_settings.key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(http_request, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        return str(body["choices"][0]["message"]["content"])
+
+    def run(
+        self,
+        profile: ResourceProfile,
+        request: Request,
+        context: ContextView,
+        max_output_tokens: int,
+    ) -> str:
         if profile.name == "calculator":
             return self.calculator.evaluate(request.prompt)
         if profile.name == "web-search":
@@ -375,6 +462,13 @@ class SimulatedBackends:
             return f"Concise local-model draft for: {request.prompt[:120]}"
         if profile.name == "small-cloud":
             return f"Small-model response for: {request.prompt[:160]}"
+        if profile.name == "three-agent-panel":
+            return (
+                "Synthesized specialist-panel response covering architecture, risk, and "
+                f"delivery perspectives for: {request.prompt[:180]}"
+            )
+        if profile.name == "large-cloud" and self.live_settings is not None:
+            return self._run_live_llm(request, context, max_output_tokens)
         return (
             "Detailed large-model analysis with assumptions, alternatives, risks, and a "
             f"recommended next step for: {request.prompt[:220]}"
@@ -382,14 +476,18 @@ class SimulatedBackends:
 
 
 class ResourceAwareAgent:
-    def __init__(self) -> None:
+    def __init__(self, live_settings: LLMSettings | None = None) -> None:
         self.analyzer = RequestAnalyzer()
         self.context_manager = ContextManager()
         self.cache = ResponseCache()
         self.predictor = ResourcePredictor()
         self.policy = LearnedPolicy()
         self.router = Router(self.predictor, self.policy)
-        self.backends = SimulatedBackends()
+        self.backends = SimulatedBackends(live_settings)
+
+    @classmethod
+    def live_from_dotenv(cls, path: str | Path = ".env") -> "ResourceAwareAgent":
+        return cls(LLMSettings.from_dotenv(path))
 
     @staticmethod
     def _measured_usage(profile: ResourceProfile, context: ContextView, answer: str) -> Usage:
@@ -397,7 +495,7 @@ class ResourceAwareAgent:
         return Usage(
             cost_usd=profile.fixed_cost_usd,
             latency_ms=profile.latency_ms,
-            input_tokens=context.tokens_after,
+            input_tokens=context.tokens_after + profile.communication_tokens,
             output_tokens=output_tokens,
             memory_mb=profile.memory_mb,
             energy_units=profile.energy_units,
@@ -407,7 +505,7 @@ class ResourceAwareAgent:
     def _observed_quality(
         profile: ResourceProfile, complexity: Complexity, sensitive: bool
     ) -> float:
-        penalty = {Complexity.SIMPLE: 0.0, Complexity.MEDIUM: 0.06, Complexity.COMPLEX: 0.14}[complexity]
+        penalty = {Complexity.SIMPLE: 0.0, Complexity.MEDIUM: 0.03, Complexity.COMPLEX: 0.04}[complexity]
         if profile.kind == "tool":
             penalty = 0.0
         if sensitive and profile.name != "large-cloud":
@@ -441,30 +539,77 @@ class ResourceAwareAgent:
         for profile in self.router.candidates(kind, complexity, sensitive):
             context = self.context_manager.reduce(request, profile.max_context_tokens)
             predicted = self.predictor.predict(profile, context.tokens_after)
-            if not self.router.fits(predicted, request.budget, total):
+            needs_verification = sensitive and profile.name == "large-cloud"
+            verification_prediction = None
+            combined_prediction = replace(predicted)
+            if needs_verification:
+                verification_prediction = self.predictor.predict(
+                    VERIFIER, min(predicted.output_tokens, VERIFIER.max_context_tokens)
+                )
+                combined_prediction.add(verification_prediction)
+            if not self.router.fits(combined_prediction, request.budget, total):
                 trace.append(f"budget: skipped {profile.name}; predicted usage exceeds a limit")
                 continue
             trace.append(
                 f"route: {profile.name} ({'local' if profile.local else 'remote'}, "
                 f"quantization={profile.quantization or 'n/a'})"
             )
+            if profile.kind == "multi-agent":
+                trace.append(
+                    "collaboration: three parallel specialists plus synthesis; "
+                    f"charged {profile.communication_tokens} coordination tokens"
+                )
             if context.pruned_messages:
                 trace.append(
                     f"context: {context.tokens_before}->{context.tokens_after} estimated tokens; "
                     f"pruned {context.pruned_messages} messages"
                 )
+            reserved_verification_tokens = (
+                verification_prediction.input_tokens + verification_prediction.output_tokens
+                if verification_prediction
+                else 0
+            )
+            remaining = request.budget.max_tokens - (
+                total.input_tokens
+                + total.output_tokens
+                + context.tokens_after
+                + profile.communication_tokens
+                + reserved_verification_tokens
+            )
             try:
-                answer = self.backends.run(profile, request, context)
-            except (ValueError, SyntaxError, ZeroDivisionError) as exc:
+                answer = self.backends.run(profile, request, context, max(1, remaining))
+            except (
+                ValueError,
+                SyntaxError,
+                ZeroDivisionError,
+                urllib.error.URLError,
+                TimeoutError,
+                KeyError,
+                json.JSONDecodeError,
+            ) as exc:
                 trace.append(f"execution: {profile.name} failed safely ({exc})")
                 self.policy.record(profile.name, False)
                 continue
 
-            remaining = request.budget.max_tokens - context.tokens_after
             answer = self._truncate(answer, remaining)
             usage = self._measured_usage(profile, context, answer)
             total.add(usage)
             quality = self._observed_quality(profile, complexity, sensitive)
+            if needs_verification:
+                verifier_usage = Usage(
+                    cost_usd=VERIFIER.fixed_cost_usd,
+                    latency_ms=VERIFIER.latency_ms,
+                    input_tokens=estimate_tokens(answer),
+                    output_tokens=1,
+                    memory_mb=VERIFIER.memory_mb,
+                    energy_units=VERIFIER.energy_units,
+                )
+                total.add(verifier_usage)
+                self.predictor.record(VERIFIER.name, verifier_usage)
+                quality = min(1.0, quality + 0.03)
+                trace.append(
+                    "verification: independent output check passed; verifier resources charged"
+                )
             accepted = quality >= target
             self.predictor.record(profile.name, usage)
             self.policy.record(profile.name, accepted)
